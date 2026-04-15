@@ -1,297 +1,429 @@
-# SF32LB52 DMA Cache 一致性问题调研报告
+﻿# SF32LB52 DMA Cache 一致性问题调研报告
 
-## 背景
-
-SF32LB52 搭载 Cortex-M33，具有写回（write-back）D-Cache，Cache Line 大小为 **32 字节**。DMA 控制器绕过 CPU Cache 直接访问物理 RAM，因此任何 CPU 与 DMA 共享的内存区域都存在 Cache 一致性（coherency）问题。
-
-本报告分析以下三个层面：
-1. Codec 驱动 commit `838118e5` 仅修复 TX 方向是否合理
-2. SF32 是否可将 DMA buffer 放到 non-cacheable 内存区域
-3. Cache 维护代码能否下沉到驱动层，对应用层透明
+> 本文档涵盖三次分析迭代：问题定位、根因解释、最终修复方案与实施。
 
 ---
 
-## 一、Codec 驱动 commit 838118e5 分析
+## 一、硬件背景
 
-### 修改内容
+SF32LB52 搭载 Cortex-M33，具有写回（write-back）D-Cache，Cache Line 大小为 **32 字节**。DMA 控制器直接挂在 AHB 总线上，完全绕过 CPU Cache，只能看到物理 RAM 上的内容。
 
-该提交在 `drivers/audio/sf32lb_codec.c` 中新增了两处 `sys_cache_data_flush_range()` 调用：
+### 32 字节 Cache Line 的依据
+
+这个值来自两个层面：
+
+**① ARM 架构规格**：Cortex-M33 的 D-Cache line size 是 **32 字节（8 words × 4B）**，这是该 IP 的硬件固定值，由 ARM 公司在 Cortex-M33 Technical Reference Manual 中定义。Cortex-A53 是 64B，服务器级 Neoverse 可达 128B，但 Cortex-M33 始终是 32B。
+
+**② Zephyr Kconfig 确认**：Zephyr 在 `arch/arm/core/cortex_m/Kconfig` 中为所有 Cortex-M CPU 设置：
+```
+config DCACHE_LINE_SIZE
+    default 32
+```
+构建产物在 `build/zephyr/include/generated/zephyr/autoconf.h` 中确认：
+```c
+#define CONFIG_DCACHE_LINE_SIZE 32
+```
+`.config-trace.json` 显示此值直接从 Cortex-M 的 Kconfig 默认值继承，SF32LB52 SoC 没有覆盖此默认值（`CONFIG_CPU_CORTEX_M33=y`）。
+
+因此代码中**不应使用字面量 `32`**，而应使用 `CONFIG_DCACHE_LINE_SIZE`，与 Zephyr 本身的以太网、USB 等驱动保持一致，且在平台移植时自动适配。
+
+```
+CPU Core
+   │
+   ├── [D-Cache, 32字节 Cache Line, 写回模式]
+   │         │
+   │    (命中时不走总线)
+   │         │
+   └─────────┴──── AHB 总线 ────┬──── SRAM (物理 RAM)
+                                │
+                          DMA Controller ──── 外设 (UART/DAC/ADC)
+```
+
+**写回 Cache 行为**：CPU 写内存时数据先进 Cache，不立即写回 RAM（标记为 dirty）；CPU 读命中 Cache 时也不访问 RAM。这是所有问题的根源。
+
+---
+
+## 二、TX 方向（CPU→DMA→外设）异常详解
+
+### 发生步骤
+
+```
+Step 1: CPU 执行 memcpy(tx_buf, "AT+CIMI\r\n")
+        [Cache Line for tx_buf] = "AT+CIMI\r\n"    ← 数据在 Cache
+        [RAM for tx_buf]        = "AT+CLCK\r\n"    ← RAM 还是旧数据
+
+Step 2: CPU 调用 uart_tx() / codec_write()
+        DMA 配置：源地址 = tx_buf 物理地址
+
+Step 3: DMA 开始传输，读 RAM[tx_buf] → "AT+CLCK\r\n"（旧数据！）
+        DMA 把旧数据送给 UART TX FIFO / DAC
+        调制解调器收到错误命令 / 喇叭播出上一帧音频
+
+Step 4: 某时刻 Cache Line 被驱逐，新数据才写回 RAM
+        但 DMA 早已传完，为时已晚
+```
+
+**需要在 DMA 启动前做** `sys_cache_data_flush_range()`。
+
+---
+
+## 三、RX 方向（外设→DMA→CPU）异常详解
+
+### 发生步骤
+
+```
+Step 1: 系统曾访问过 rx_dma_buf，Cache 中有该地址的快照（旧数据）
+
+Step 2: UART/ADC 数据来了，DMA 写入 RAM[rx_dma_buf] = 新数据
+        Cache 不知道，仍持有旧快照
+
+Step 3: DMA 完成，触发回调
+        CPU 读 rx_dma_buf → 命中 Cache → 读到旧数据
+        AT 解析器/Opus 编码器拿到的是错误内容
+```
+
+**需要在回调通知应用前做** `sys_cache_data_invd_range()`。
+
+---
+
+## 四、Cache Line 对齐的重要性
+
+若 buffer 起始地址未对齐到 **`CONFIG_DCACHE_LINE_SIZE`（Cortex-M33 上为 32 字节）**，`sys_cache_data_invd_range()` 会以 Cache Line 为粒度操作，导致相邻变量的 Cache 也被失效（false sharing）：
+
+> **对齐值的来源**：`CONFIG_DCACHE_LINE_SIZE` 是 Zephyr 在 `arch/arm/core/cortex_m/Kconfig` 中为 Cortex-M（含 M33）设置的默认值 32。这是 ARM Cortex-M33 TRM 规定的硬件固定值（8 words × 4B = 32B），与 Cortex-A（64B）或服务器级（128B）不同。代码中使用宏而非字面量，以便平台移植时自动适配。
+
+```
+地址:  0   8   16  20  24  32
+       [--- 其他变量 ---|--- rx_buf 前12B ---]
+       <-------- 同一 Cache Line (32B) ------->
+
+invd 整条 Cache Line → 其他变量的 dirty Cache 数据丢失 → 内存损坏
+```
+
+---
+
+## 五、Codec commit 838118e5 分析（TX-only 修复）
+
+该提交在 `drivers/audio/sf32lb_codec.c` 新增了 flush：
 
 ```c
-// codec_write() — 应用写入音频数据时
+// codec_write() — 应用写入 PCM 数据后
 sys_cache_data_flush_range(dev_data->tx_write_ptr, dev_data->tx_half_dma_size);
 
-// codec_configure() — 初始化 tx_buf 清零后
+// codec_configure() — 初始化清零 tx_buf 后
 sys_cache_data_flush_range(data->tx_buf, data->tx_half_dma_size * 2);
 ```
 
-两处均为 **TX 方向（DAC 播放）**：CPU 写数据 → Cache → flush → RAM → DMA → DAC 输出。
+**TX 方向修复正确**，但遗漏了以下问题：
 
-### TX-only 修复是否合理？
-
-**合理，但不够完整。** 逻辑如下：
-
-- **TX 方向**：CPU 写入 `tx_buf`，数据先进 Cache，DMA 从 RAM 读取数据发给 DAC。若不 flush，DMA 读到的是旧的 RAM 内容。此次修复正确。
-- **RX 方向**：DMA 从 ADC 读数据写入 `rx_buf`（RAM），CPU 通过 `rx_done` 回调读取。若不 invalidate，CPU 命中 Cache 中的旧数据，读不到 DMA 写入的新内容。
-
-**结论：RX 方向（ADC 录音）存在同样的 Cache 一致性 bug，当前提交未修复。**
-
-### Codec RX 方向存在的问题
-
-#### 问题一：对齐不足
-
-`rx_buf` 和 `tx_buf` 都用以下方式分配：
-
-```c
-k_aligned_alloc(sizeof(uint32_t), data->rx_half_dma_size * 2);
-// sizeof(uint32_t) = 4 字节 —— 但 Cache Line 是 32 字节
-```
-
-`sys_cache_data_invd_range()` 操作以 Cache Line 为粒度，若 buffer 起始地址不对齐到 32 字节，会影响相邻共用同一 Cache Line 的无关变量，导致数据损坏。
-
-**正确做法：`k_aligned_alloc(32, ...)`**
-
-#### 问题二：RX 回调前缺少 Cache 失效
-
-`dma_rx_callback` 中直接调用用户回调，未执行 `sys_cache_data_invd_range()`：
-
-```c
-// 当前代码（有 bug）
-void dma_rx_callback(...) {
-    if (status == DMA_STATUS_COMPLETE) {
-        if (data->rx_done) {
-            // 直接给应用，此时 CPU 可能读到 Cache 中的旧数据
-            data->rx_done(dev, data->rx_buf + data->rx_half_dma_size, ...);
-        }
-    } else if (status == DMA_STATUS_HALF_COMPLETE) {
-        if (data->rx_done) {
-            data->rx_done(dev, data->rx_buf, ...);
-        }
-    }
-}
-```
-
-**正确做法：**
-
-```c
-void dma_rx_callback(...) {
-    uint8_t *ptr;
-    if (status == DMA_STATUS_COMPLETE) {
-        ptr = data->rx_buf + data->rx_half_dma_size;
-    } else if (status == DMA_STATUS_HALF_COMPLETE) {
-        ptr = data->rx_buf;
-    } else { ... }
-    // 先失效 Cache，再通知应用
-    sys_cache_data_invd_range(ptr, data->rx_half_dma_size);
-    data->rx_done(dev, ptr, data->rx_half_dma_size, data->rx_cb_user_data);
-}
-```
+| 问题 | 描述 |
+|---|---|
+| `dma_rx_callback` 无 invd | DMA 写完 ADC 数据通知应用前未失效 Cache，CPU 读到旧录音 |
+| `tx_buf`/`rx_buf` 对齐仅 4B | `k_aligned_alloc(sizeof(uint32_t), ...)` = 4字节，Cache Line 需要 32 字节 |
 
 ---
 
-## 二、UART 驱动 DMA Cache 问题
+## 六、UART 驱动现状（修复前）
 
-对照 commit `6e1ab80`（uart_raw_test 中的修复）：
-
-### RX 方向（已在应用层修复）
-
-应用在 `UART_RX_RDY` 回调中手动 invalidate：
-
-```c
-sys_cache_data_invd_range((void *)(evt->data.rx.buf + evt->data.rx.offset),
-                           evt->data.rx.len);
-```
-
-`rx_dma_slab` 对齐已修正为 32 字节。
-
-### TX 方向（未修复）
-
-| Buffer | 位置 | 实际对齐 | Cache Flush |
-|---|---|---|---|
-| `tx_buf[192]` | `at_cmd_run()` 内 static | 无保证 | ❌ 无 |
-| `mipsend_tx_buf[1500]` | 全局 static `char` | 1 字节 | ❌ 无 |
-
-`raw_tx()` 中直接调用 `uart_tx()`，未做任何 flush：
-
-```c
-static void raw_tx(const uint8_t *buf, size_t len)
-{
-    log_hex("TX", buf, (int)len);
-    uart_tx(modem_uart, buf, len, SYS_FOREVER_US);  // DMA 直接读 RAM
-    k_sem_take(&tx_done_sem, K_FOREVER);
-}
-```
-
-### UART 驱动层现状
-
-`drivers/serial/uart_sf32lb.c` 中的 `uart_async_sf32lb_tx()` 在 DMA 启动前无任何 cache 操作；所有三个 `UART_RX_RDY` 触发点（line 473、583、705）前均无 `sys_cache_data_invd_range()`。**驱动层完全没有 Cache 维护代码。**
+`drivers/serial/uart_sf32lb.c` 中：
+- `uart_async_sf32lb_tx()`：启动 DMA 前无 flush
+- 3 处 `UART_RX_RDY` 触发点（async_rx_idle / dma_rx_done / rx_disable）：均无 invd
+- 驱动层完全没有 Cache 维护代码，责任全甩给应用层
 
 ---
 
-## 三、SF32 non-cacheable 内存区域
+## 七、为什么 non-cacheable 内存（Shared RAM）没有问题
 
-### 硬件支持情况
-
-SF32LB52 的 DTS（`dts/arm/sifli/sf32lb52x-ram012.dtsi`）定义了两个被 MPU 标记为 non-cacheable 的专用内存区域：
+SF32LB52 DTS 定义了两段被 MPU 标记为 non-cacheable 的内存：
 
 ```dts
-sram0_shared: memory@2007fc00 {
-    compatible = "zephyr,memory-region", "mmio-sram";
-    reg = <0x2007fc00 DT_SIZE_K(1)>;        /* 1 KB */
-    zephyr,memory-region = "sram0_shared";
-    zephyr,memory-attr = <DT_MEM_ARM(ATTR_MPU_RAM_NOCACHE)>;
-};
-
+/* dts/arm/sifli/sf32lb52x-ram012.dtsi */
 sram1_shared: memory@20400000 {
-    compatible = "zephyr,memory-region", "mmio-sram";
     reg = <0x20400000 DT_SIZE_K(64)>;       /* 64 KB */
-    zephyr,memory-region = "sram1_shared";
+    zephyr,memory-attr = <DT_MEM_ARM(ATTR_MPU_RAM_NOCACHE)>;
+};
+sram0_shared: memory@2007fc00 {
+    reg = <0x2007fc00 DT_SIZE_K(1)>;        /* 1 KB */
     zephyr,memory-attr = <DT_MEM_ARM(ATTR_MPU_RAM_NOCACHE)>;
 };
 ```
 
-MPU 驱动（`arch/arm/core/mpu/arm_mpu.c`）读取 DTS 属性后将这两段内存配置为 `REGION_RAM_NOCACHE_ATTR`，CPU 访问这些地址时硬件强制绕过 Cache，无需任何软件 Cache 维护。
-
-当前 build 的 map 文件确认这两段 section 已正确链接：
+MPU 硬件禁止对这段地址做缓存：
 
 ```
-sram0_shared   0x2007fc00   0x400   rw   (1KB, 当前为空)
-sram1_shared   0x20400000  0x10000  rw   (64KB, 当前为空)
+普通 SRAM：  CPU → [Cache 可能滞留] → RAM ← DMA  （不一致）
+sram1_shared：CPU → AHB → RAM ← DMA              （永远一致）
 ```
 
-### Zephyr 中使用 non-cacheable 内存的方式
-
-**方式一：`__nocache` 属性（静态变量）**
-
-需开启 `CONFIG_NOCACHE_MEMORY=y`：
-
-```c
-// 静态 DMA buffer 自动放入 non-cacheable section
-static uint8_t __nocache rx_dma_buf[256];
-```
-
-注意：`CONFIG_NOCACHE_MEMORY` 当前在 uart_raw_test 的 build 中**未启用**（`.config` 中确认为 `not set`）。
-
-**方式二：直接使用已知地址的 non-cacheable 区域（`sram1_shared`）**
-
-```c
-// 在 .overlay 或代码中将 buffer 声明到 sram1_shared section
-static uint8_t __attribute__((section(".sram1_shared.noinit"))) rx_dma_buf[256];
-```
-
-**方式三：从 non-cacheable heap 动态分配**
-
-```c
-// 定义 nocache heap（需 CONFIG_NOCACHE_MEMORY）
-K_HEAP_DEFINE_NOCACHE(dma_heap, 4096);
-uint8_t *buf = k_heap_alloc(&dma_heap, 256, K_NO_WAIT);
-```
-
-### 使用 non-cacheable 内存的代价
-
-| 项目 | 说明 |
-|---|---|
-| 访问速度 | 每次读写都经总线直达 RAM，无 Cache 加速，比 cacheable 内存慢约 5-10x |
-| 资源限制 | `sram1_shared` 仅 64KB，需与蓝牙核心共享；`sram0_shared` 仅 1KB |
-| 可行性 | 对于 UART/Codec DMA buffer（通常 < 4KB），**完全可行** |
-| 编程简化 | 一旦使用 non-cacheable 区域，无需任何 `sys_cache_*` 调用 |
+放到 non-cacheable 区域后，CPU 和 DMA 永远看到同一份 RAM 内容，无需任何软件 Cache 维护，是最干净的根治方案。当前两段区域均为空闲，完全够用。
 
 ---
 
-## 四、Cache 维护代码能否下沉到驱动层
+## 八、修复方案（驱动层下沉，应用层无感）
 
-### 结论：**可以且应该下沉，但目前两个驱动均未实现**
+### 8.1 修复原则
 
-### UART 驱动层方案
+Cache 维护下沉到驱动层，应用层只需保证 DMA buffer **32 字节对齐**（防止 false sharing），不需要调用任何 `sys_cache_*` 函数。
 
-在 `drivers/serial/uart_sf32lb.c` 中：
+### 8.2 UART 驱动修复（`drivers/serial/uart_sf32lb.c`）
 
-**TX flush**（在 `uart_async_sf32lb_tx()` 启动 DMA 前）：
+**新增 `#include <zephyr/cache.h>`**（在 `CONFIG_UART_ASYNC_API` 块内）
+
+**TX flush** — `uart_async_sf32lb_tx()` 中，DMA 启动前：
 
 ```c
-static int uart_async_sf32lb_tx(const struct device *dev, const uint8_t *buf,
-                                 size_t len, int32_t timeout)
-{
-    // ... 参数校验 ...
-    sys_cache_data_flush_range((void *)buf, len);   // 新增
-    sf32lb_dma_reload_dt(...);
-    sf32lb_dma_start_dt(&config->tx_dma);
-    // ...
+data->async.tx.buf = buf;
+data->async.tx.len = len;
+
+sys_cache_data_flush_range((void *)data->async.tx.buf, data->async.tx.len); /* 新增 */
+sf32lb_dma_reload_dt(...);
+sf32lb_dma_start_dt(&config->tx_dma);
+```
+
+**RX invd** — 3 处 `UART_RX_RDY` 事件发送前，统一在 callback 调用前 invd：
+
+- `async_rx_idle()`（IDLE 中断路径）：irq unlock 后、cb 前
+- `uart_sf32lb_dma_rx_done()`（DMA 环绕路径）：cb 前
+- `uart_async_sf32lb_rx_disable()`（主动关闭路径）：cb 前
+
+### 8.3 Codec 驱动修复（`drivers/audio/sf32lb_codec.c`）
+
+**对齐修正**（`codec_configure()`）：
+
+```c
+/* 修复前 */
+k_aligned_alloc(sizeof(uint32_t), data->tx_half_dma_size * 2);  /* 4B 对齐 */
+
+/* 修复后 — 使用 Kconfig 宏而非字面量 32 */
+k_aligned_alloc(CONFIG_DCACHE_LINE_SIZE, data->tx_half_dma_size * 2);  /* = 32B on Cortex-M33 */
+```
+
+`CONFIG_DCACHE_LINE_SIZE` 由 `autoconf.h` 提供（Zephyr 构建系统自动包含），值来自 `arch/arm/core/cortex_m/Kconfig` 的默认值 32，SF32LB52（Cortex-M33）无覆盖。使用宏而非字面量，在工具链层面有明确出处，也便于未来移植到 Cache Line 不同的平台。
+
+**RX invd**（`dma_rx_callback()`，callback 前调用）：
+
+```c
+if (status == DMA_STATUS_COMPLETE) {
+    sys_cache_data_invd_range(data->rx_buf + data->rx_half_dma_size,  /* 新增 */
+                              data->rx_half_dma_size);
+    data->rx_done(dev, data->rx_buf + data->rx_half_dma_size, ...);
+} else if (status == DMA_STATUS_HALF_COMPLETE) {
+    sys_cache_data_invd_range(data->rx_buf, data->rx_half_dma_size);  /* 新增 */
+    data->rx_done(dev, data->rx_buf, ...);
 }
 ```
 
-**RX invalidate**（在所有 `UART_RX_RDY` 事件发出前）：
+### 8.4 应用层清理（`samples/drivers/modem/uart_raw_test/src/main.c`）
 
-三处 `evt.type = UART_RX_RDY` 赋值后、`data->async.cb(...)` 调用前，统一加：
-
-```c
-sys_cache_data_invd_range(evt.data.rx.buf + evt.data.rx.offset, evt.data.rx.len);
-```
-
-这样应用层的 `modem_uart_cb` 中就不再需要手动 invalidate，`rx_dma_slab` 的对齐可保留在 32 字节（以满足部分操作的对齐约束），但也可以改回 4 字节。
-
-### Codec 驱动层方案
-
-**TX flush**：已在 commit `838118e5` 中部分修复，但 `tx_buf` 的 `k_aligned_alloc` 对齐应改为 32：
-
-```c
-data->tx_buf = k_aligned_alloc(32, data->tx_half_dma_size * 2);
-```
-
-**RX invalidate**：在 `dma_rx_callback` 中，调用 `rx_done` 前加：
-
-```c
-sys_cache_data_invd_range(ptr, data->rx_half_dma_size);
-```
-
-`rx_buf` 的 `k_aligned_alloc` 同样应改为 32。
-
-### 驱动层方案的限制
-
-| 限制 | 说明 |
-|---|---|
-| 对齐约束照旧 | 即便驱动做了 `sys_cache_*`，应用传入的 buffer 起始地址仍需 32 字节对齐，否则会影响相邻变量。这个约束无法完全对应用透明。|
-| Zephyr API 规范 | Zephyr 的 `uart_tx()` / `uart_rx_enable()` API 文档要求调用者保证 buffer 是 DMA-safe（对齐且 coherent），驱动层做 cache 维护超出规范，但在自有驱动中是可接受的工程做法。|
-| non-cacheable 方案下无需驱动介入 | 若改用 non-cacheable 内存，驱动和应用均无需任何 `sys_cache_*` 调用，是最干净的方案。|
+- 移除 `#include <zephyr/cache.h>`
+- 移除 `UART_RX_RDY` 回调中的手动 `sys_cache_data_invd_range()` 调用
+- `rx_dma_slab` 保留 32 字节对齐（防止 invd false sharing，非 Cache 维护）
 
 ---
 
-## 五、综合方案推荐
+## 九、修复后各模块缺陷状态
 
-### 方案 A：non-cacheable 内存（推荐，最干净）
-
-将所有 DMA buffer 放到 `sram1_shared`（0x20400000, 64KB, non-cacheable）：
-
-- 启用 `CONFIG_NOCACHE_MEMORY=y`
-- 驱动内部的 `tx_buf` / `rx_buf` 用 `K_HEAP_DEFINE_NOCACHE` 分配
-- UART 应用的 `rx_dma_slab`、`tx_buf`、`mipsend_tx_buf` 用 `__nocache` 标记
-- 无需任何 `sys_cache_*` 调用
-
-**代价**：non-cacheable 内存访问速度较慢，但音频/UART buffer 访问频率低，影响微乎其微。
-
-### 方案 B：驱动层做 Cache 维护（次优）
-
-在 UART 驱动和 Codec 驱动的关键路径加 `sys_cache_data_flush_range` / `sys_cache_data_invd_range`，同时修正 `k_aligned_alloc` 的对齐参数为 32。应用层只需保证传入 buffer 32 字节对齐。
-
-### 方案 C：维持现状（不推荐）
-
-当前状态：
-- Codec TX：已修复（838118e5）
-- Codec RX：**未修复**，存在 ADC 录音数据损坏风险
-- UART TX：**未修复**，存在发送数据错误风险（小数据量下概率较低但不可靠）
-- UART RX：应用层已部分修复（6e1ab80）
+| 组件 | 方向 | 修复内容 | 状态 |
+|---|---|---|---|
+| UART 驱动 | TX | `uart_async_sf32lb_tx()` DMA 前 flush | ✅ 已修复 |
+| UART 驱动 | RX (IDLE路径) | `async_rx_idle()` callback 前 invd | ✅ 已修复 |
+| UART 驱动 | RX (DMA环绕路径) | `dma_rx_done()` callback 前 invd | ✅ 已修复 |
+| UART 驱动 | RX (关闭路径) | `rx_disable()` callback 前 invd | ✅ 已修复 |
+| Codec 驱动 | TX | `codec_write()` flush（838118e5已有） | ✅ 已有 |
+| Codec 驱动 | TX 对齐 | `tx_buf` 从 4B 改为 32B 对齐 | ✅ 已修复 |
+| Codec 驱动 | RX | `dma_rx_callback()` callback 前 invd | ✅ 已修复 |
+| Codec 驱动 | RX 对齐 | `rx_buf` 从 4B 改为 32B 对齐 | ✅ 已修复 |
+| UART 应用 | TX | 无需修改（驱动已处理） | ✅ 透明 |
+| UART 应用 | RX | 移除手动 invd | ✅ 已清理 |
 
 ---
 
-## 附：缺陷速查表
+## 十、备选方案：non-cacheable 内存（更彻底）
 
-| 组件 | 方向 | 问题 | 风险 | 是否修复 |
-|---|---|---|---|---|
-| Codec 驱动 | TX | `tx_buf` 对齐仅 4B | flush 可能污染相邻数据 | ❌ |
-| Codec 驱动 | TX | `codec_write` 有 flush | 正确 | ✅ 838118e5 |
-| Codec 驱动 | RX | `rx_buf` 对齐仅 4B | invd 污染相邻数据 | ❌ |
-| Codec 驱动 | RX | `dma_rx_callback` 无 invd | CPU 读到 ADC 旧数据 | ❌ |
-| UART 驱动 | TX | 驱动无 flush | DMA 读到 TX 旧数据 | ❌ |
-| UART 应用 | TX | `tx_buf`/`mipsend_tx_buf` 无 flush | DMA 读到 TX 旧数据 | ❌ |
-| UART 应用 | RX | `rx_dma_slab` 对齐改为 32B | 对齐正确 | ✅ 6e1ab80 |
-| UART 应用 | RX | `UART_RX_RDY` 回调中有 invd | 正确 | ✅ 6e1ab80 |
+若后续想彻底消除 Cache 维护的复杂性：
+
+1. 开启 `CONFIG_NOCACHE_MEMORY=y`
+2. 阶段性将 DMA buffer 放到 `sram1_shared`（64KB, 0x20400000）
+3. 驱动内部 `tx_buf`/`rx_buf` 用 `K_HEAP_DEFINE_NOCACHE` 分配
+4. 应用 `rx_dma_slab` 用 `__nocache` 标记
+5. 所有 `sys_cache_*` 调用均可删除
+
+代价仅是 non-cacheable 区域 CPU 访问慢约 5-10x，对于 DMA buffer 影响可忽略不计。
+
+---
+
+## 十一、通俗解释：应用的 cacheable buffer 是如何安全传输的
+
+### 核心问题
+
+> 应用层有一块 64 字节要发送、一块 64 字节用来接收，这两块内存都是普通 cacheable 的。数据是怎么发出去、收进来的？驱动做了什么让它们不出问题？
+
+答案的关键在于 **UART 驱动** 和 **Codec 驱动** 采用了完全不同的缓冲策略。
+
+---
+
+### UART 驱动：无内部缓冲，应用 buffer 直接给 DMA
+
+UART 驱动不持有任何自己的数据缓冲区，应用的 buffer **就是** DMA 的源/目标，没有任何中间拷贝。
+
+#### UART TX（发送 64 字节）
+
+```
+应用层                   UART 驱动（修复后）              硬件
+─────────────────────────────────────────────────────────────────
+uint8_t tx_buf[64];      ┌──────────────────────────┐
+填好 tx_buf 内容          │ uart_async_sf32lb_tx()    │
+                         │                          │
+uart_tx(uart,            │ 1. 记录 buf 指针和长度    │
+        tx_buf, 64, -1) ─►                          │
+                         │ 2. flush(tx_buf, 64)     │  ← 把 Cache 里的
+                         │    ↓ Cache 写回 RAM       │    数据强制刷入 RAM
+                         │                          │
+                         │ 3. 配置 DMA：             │
+                         │    源 = tx_buf 物理地址   │
+                         │                          │
+                         │ 4. 启动 DMA              ─►  DMA 读 RAM[tx_buf]
+                         └──────────────────────────┘   → UART TX FIFO
+                                                         → 发给调制解调器
+```
+
+**关键点**：在 `uart_tx()` 内部，驱动已经替应用做了 flush，把 Cache 中还未写回的数据强制刷入 RAM，之后 DMA 从 RAM 读到的一定是应用刚写的新数据。应用不需要关心这件事。
+
+#### UART RX（接收 64 字节）
+
+```
+应用层                   UART 驱动（修复后）              硬件
+─────────────────────────────────────────────────────────────────
+/* 提供 256 字节 DMA buffer */
+uint8_t rx_dma_buf[256]; ┌──────────────────────────┐
+RING_BUF_DECLARE(rx_rb,  │ uart_rx_enable()          │
+        2048);           │                          │
+                         │ 配置 DMA：               │
+uart_rx_enable(uart,     │   目标 = rx_dma_buf      │
+  rx_dma_buf, 256) ─────►│           物理地址        │
+                         └──────────────────────────┘
+                                    ↑ UART 收到数据
+                                    │
+                             DMA 写入 RAM[rx_dma_buf]
+                             注意：Cache 里还是旧数据！
+                                    │
+                         ┌──────────▼───────────────┐
+                         │ UART_RX_RDY 事件触发      │
+                         │                          │
+                         │ 驱动先 invd(rx_dma_buf,  │  ← 丢弃 Cache 中的
+                         │          offset, len)    │    旧快照
+                         │                          │
+                         │ 再调用应用回调            ─►  应用回调里
+                         └──────────────────────────┘   从 rx_dma_buf 读
+                                                         读到最新数据
+
+    /* 应用回调里把数据放到 ring buffer */
+    ring_buf_put(&rx_rb, rx_dma_buf + offset, len);
+    /* rx_rb 里的 64 字节完全是 CPU 操作，无 DMA，无需 cache 处理 */
+```
+
+**关键点**：驱动在通知应用之前已经做了 invd，丢弃了 Cache 中的旧快照，CPU 下次读 `rx_dma_buf` 时会直接从 RAM 拿 DMA 写入的新数据。应用从 ring buffer 取出的那 64 字节，是纯 CPU 操作，完全不涉及 DMA，cacheable 没有任何问题。
+
+---
+
+### Codec 驱动：有内部缓冲，应用 buffer 不接触 DMA
+
+Codec 驱动**内部维护两个双缓冲区**（`tx_buf` 和 `rx_buf`），DMA 只操作这两块驱动内部的内存。应用的 buffer 只做 CPU 层面的数据搬运，**DMA 永远不知道应用 buffer 的存在**。
+
+```
+驱动内部内存（cacheable, 32字节对齐）：
+  tx_buf[block_size * 2]   — DMA 持续从这里读 → DAC 播放
+  rx_buf[block_size * 2]   — DMA 持续把 ADC 数据写到这里
+```
+
+#### Codec TX（应用写入 64 字节 PCM 数据，驱动播放）
+
+```
+应用层                   Codec 驱动（修复后）             DMA 层
+─────────────────────────────────────────────────────────────────
+uint8_t pcm[64];         驱动内部: tx_buf[2N]
+(CPU 填好音频数据)         DMA 持续循环从 tx_buf 读 → DAC
+
+codec_write(dev,          ┌──────────────────────────┐
+            pcm, 64) ───►│ 1. memcpy(tx_write_ptr,  │  ← CPU 读 pcm（Cache
+                         │          pcm, 64)         │    命中，读到最新数据）
+                         │                          │    CPU 写 tx_buf（进
+                         │                          │    Cache，RAM 暂时旧）
+                         │ 2. flush(tx_write_ptr,   │  ← 把 tx_buf 的 Cache
+                         │          block_size)      │    强制写回 RAM
+                         └──────────────────────────┘
+                                                         DMA 下次读 tx_buf
+                                                         拿到的是新音频数据
+                                                         → DAC → 喇叭
+```
+
+**为什么 memcpy 本身不存在一致性问题？**
+
+memcpy 是纯 CPU 操作，CPU 读 `pcm` 和写 `tx_buf` 都经过同一个 D-Cache。Cache 一致性问题只发生在 **CPU ↔ DMA** 的边界，而不是 CPU 内部的读写之间：
+
+- CPU 读 `pcm`：CPU 自己之前写的，数据就在 Cache 里，直接命中，读到最新值 ✅
+- CPU 写 `tx_buf`：数据进 Cache（RAM 暂时旧）→ 之后 DMA 要读 RAM ⚠️ → 需要 flush ✅
+
+**flush 的是驱动内部的 `tx_buf`，不是应用的 `pcm`。** 应用的 `pcm` 全程只被 CPU 读写，永远不会有一致性问题，cacheable 完全没问题。
+
+#### Codec RX（DMA 录音，应用读取 64 字节 PCM 数据）
+
+```
+硬件/DMA 层              Codec 驱动（修复后）             应用层
+─────────────────────────────────────────────────────────────────
+ADC 采样数据             驱动内部: rx_buf[2N]
+DMA 持续写入 rx_buf      (应用登记了 rx_done 回调)
+                                    │
+DMA 完成半块             ┌──────────▼───────────────┐
+  → dma_rx_callback()   │ 1. invd(rx_buf 对应半块) │  ← 丢弃 Cache 旧快照
+                         │                          │    CPU 下次读走 RAM
+                         │ 2. rx_done(dev,          │    拿 DMA 写的新数据
+                         │      ptr, size, ...) ────►│
+                         └──────────────────────────┘
+                                                         应用回调被触发
+                                                         ptr 指向 rx_buf
+                                                         的某半块（驱动内部）
+
+    /* 应用把数据复制到自己的 buf */
+    uint8_t my_buf[64];
+    memcpy(my_buf, ptr, 64);
+    /* CPU 读 rx_buf 时走 RAM（已 invd），读到 DMA 写的最新采样 */
+    /* CPU 写 my_buf 进 Cache，之后 Opus 编码器读 my_buf 也命中 Cache */
+    /* my_buf 全程只有 CPU 操作，无 DMA，天然无一致性问题 */
+    opus_encode(..., my_buf, ...);
+```
+
+**invd 的是驱动内部的 `rx_buf`。** 应用 `my_buf` 全程只被 CPU 读写，DMA 从不碰它，cacheable 完全没问题。
+
+---
+
+### Cache 一致性问题的本质边界
+
+> **只有 CPU 与 DMA 共享同一块内存时才存在一致性问题。纯 CPU 读写（包括 memcpy 两端）永远是一致的。**
+
+| 操作类型 | 是否有一致性问题 | 原因 |
+|---|---|---|
+| CPU 写 → CPU 读（同一块内存） | ❌ 无 | 同一个 Cache，读写都命中，永远最新 |
+| CPU 写 → DMA 读（TX 方向） | ⚠️ 有 | CPU 写在 Cache，DMA 读的是 RAM（可能旧） |
+| DMA 写 → CPU 读（RX 方向） | ⚠️ 有 | DMA 写入 RAM，CPU 读 Cache（可能是旧快照） |
+| DMA 写 → DMA 读（用途不同）| ❌ 无 | DMA 直接走 RAM，双方都不经过 Cache |
+
+---
+
+### 两种驱动的本质区别
+
+| 对比项 | UART 驱动 | Codec 驱动 |
+|---|---|---|
+| 驱动有无内部缓冲区 | **无** | **有**（tx_buf / rx_buf，双缓冲） |
+| DMA 操作的是谁的内存 | 应用直接提供的 buffer | 驱动内部的 tx_buf / rx_buf |
+| 应用 buffer 接触 DMA 吗 | ✅ 是，直接作为 DMA 源/目标 | ❌ 否，只做 CPU memcpy 的源/目标 |
+| 应用 buffer 有 cache 问题吗 | 有，交给驱动处理 | **没有**，DMA 不碰它 |
+| 驱动如何保证一致性 | TX: flush 应用 buf；RX: invd 应用 buf | TX: flush 内部 tx_buf；RX: invd 内部 rx_buf |
+| 应用层需要做什么 | 无感（驱动透明处理） | 无感（驱动透明处理） |
+
+---
+
+### 一句话总结
+
+> **UART**：驱动没有自己的缓冲区，应用的 buffer 直接给 DMA 用，驱动在发送前 flush、在接收通知前 invd，应用无感。
+> **Codec**：驱动有内部缓冲区（DMA 只操作这个），应用的数据通过 memcpy 进出驱动内部缓冲，应用自己的 buffer 完全不接触 DMA，天然无一致性问题。
